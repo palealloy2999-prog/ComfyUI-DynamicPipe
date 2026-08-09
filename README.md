@@ -4,6 +4,8 @@
 
 A pair of ComfyUI custom nodes that packs any number of values of any type into a single dynamic pipe and unpacks them elsewhere in the workflow.
 
+<img width="1324" height="645" alt="image" src="https://github.com/user-attachments/assets/0a07fa5e-98ab-460a-a17f-9345277a432c" />
+
 ## Nodes
 
 - `to Dynamic Pipe`: Packs IMAGE, MODEL, LATENT, STRING, and other values into one output.
