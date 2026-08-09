@@ -24,7 +24,9 @@ Disconnecting `dynamic_pipe` from `from Dynamic Pipe` preserves its last output 
 
 ## Installation
 
+```shell
+cd ComfyUI/custom_nodes
+git clone https://github.com/palealloy2999-prog/ComfyUI-DynamicPipe.git
 ```
-cd ComfyUI/custom_nondes
-git clone https://github.com/palealloy2999-prog/ComfyUI-DynamicPipe
-```
+
+Restart ComfyUI and reload the browser. No additional dependencies are required.

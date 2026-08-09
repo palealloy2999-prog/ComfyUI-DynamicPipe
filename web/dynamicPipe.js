@@ -12,6 +12,30 @@ function isNode(node, type) {
 }
 
 
+function graphFor(node) {
+  return node?.graph || app.graph;
+}
+
+
+function linkFor(graph, linkId) {
+  return graph?.getLink?.(linkId) || graph?.links?.[linkId];
+}
+
+
+function nodesFor(graph) {
+  return graph?._nodes || graph?.nodes || [];
+}
+
+
+function graphsFor(rootGraph) {
+  const graphs = [rootGraph];
+  if (rootGraph?.subgraphs?.values) {
+    graphs.push(...rootGraph.subgraphs.values());
+  }
+  return graphs;
+}
+
+
 function schemaWidget(node) {
   return node.widgets?.find((widget) => widget.name === SCHEMA_WIDGET);
 }
@@ -81,14 +105,26 @@ function uniqueLabel(node, desired, currentInput) {
 }
 
 
-function sourceDetails(linkInfo) {
-  const origin = app.graph?.getNodeById(linkInfo?.origin_id);
-  const output = origin?.outputs?.[linkInfo?.origin_slot];
+function sourceDetails(node, linkInfo, connectedSlot) {
+  const graph = graphFor(node);
+  const origin = graph?.getNodeById(linkInfo?.origin_id);
+  const output =
+    origin?.outputs?.[linkInfo?.origin_slot] ||
+    origin?.slots?.[linkInfo?.origin_slot] ||
+    origin?.allSlots?.[linkInfo?.origin_slot] ||
+    graph?.inputNode?.slots?.[linkInfo?.origin_slot] ||
+    connectedSlot;
   if (!output) {
     return { name: "value", type: String(linkInfo?.type || "*") };
   }
 
-  const name = output.label || output.name || output.type || "value";
+  const name =
+    output.displayName ||
+    output.label ||
+    output.localized_name ||
+    output.name ||
+    output.type ||
+    "value";
   return { name: String(name), type: String(linkInfo?.type || output.type || "*") };
 }
 
@@ -122,9 +158,10 @@ function parseWidgetSchema(node) {
 }
 
 
-function updateLinkType(output, type) {
+function updateLinkType(node, output, type) {
+  const graph = graphFor(node);
   for (const linkId of output.links || []) {
-    const link = app.graph?.links?.[linkId];
+    const link = linkFor(graph, linkId);
     if (!link) {
       continue;
     }
@@ -157,7 +194,7 @@ function applySchemaToUnpack(node, schema) {
       output.type = field.type;
     }
     output.dynamicPipeKey = field.key;
-    updateLinkType(output, field.type);
+    updateLinkType(node, output, field.type);
   }
 
   while ((node.outputs?.length || 0) > schema.length) {
@@ -179,8 +216,9 @@ function upstreamPack(node) {
   let input = current.inputs?.find((slot) => slot.name === "dynamic_pipe") || current.inputs?.[0];
 
   while (input?.link != null) {
-    const link = app.graph?.links?.[input.link];
-    const origin = app.graph?.getNodeById(link?.origin_id);
+    const graph = graphFor(current);
+    const link = linkFor(graph, input.link);
+    const origin = graph?.getNodeById(link?.origin_id);
     if (!origin || visited.has(origin.id)) {
       return null;
     }
@@ -211,7 +249,7 @@ function syncUnpack(node) {
 
 
 function notifyConnectedUnpacks(pack) {
-  for (const node of app.graph?._nodes || []) {
+  for (const node of nodesFor(graphFor(pack))) {
     if (isNode(node, UNPACK) && upstreamPack(node) === pack) {
       applySchemaToUnpack(node, readPackSchema(pack));
     }
@@ -227,14 +265,14 @@ function updatePack(node) {
 }
 
 
-function configurePackInput(node, slotIndex, connected, linkInfo) {
+function configurePackInput(node, slotIndex, connected, linkInfo, connectedSlot) {
   const input = node.inputs?.[slotIndex];
   if (!input) {
     return;
   }
 
   if (connected) {
-    const source = sourceDetails(linkInfo);
+    const source = sourceDetails(node, linkInfo, connectedSlot);
     input.label = uniqueLabel(node, source.name, input);
     input.type = source.type;
     input.dynamicPipeType = source.type;
@@ -265,6 +303,17 @@ function setupNode(node) {
         input.dynamicPipeConfigured = false;
       }
     }
+    for (const input of node.inputs || []) {
+      if (input.link == null) {
+        continue;
+      }
+      const link = linkFor(graphFor(node), input.link);
+      const source = sourceDetails(node, link);
+      input.label = uniqueLabel(node, source.name, input);
+      input.type = source.type;
+      input.dynamicPipeType = source.type;
+      input.dynamicPipeConfigured = true;
+    }
     updatePack(node);
   } else if (isNode(node, UNPACK)) {
     applySchemaToUnpack(node, parseWidgetSchema(node));
@@ -282,14 +331,14 @@ app.registerExtension({
     }
 
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
-    nodeType.prototype.onConnectionsChange = function (type, slotIndex, connected, linkInfo) {
+    nodeType.prototype.onConnectionsChange = function (type, slotIndex, connected, linkInfo, connectedSlot) {
       const result = onConnectionsChange?.apply(this, arguments);
       if (type !== LiteGraph.INPUT) {
         return result;
       }
 
       if (nodeData.name === PACK) {
-        setTimeout(() => configurePackInput(this, slotIndex, connected, linkInfo), 0);
+        setTimeout(() => configurePackInput(this, slotIndex, connected, linkInfo, connectedSlot), 0);
       } else if (connected && slotIndex === 0) {
         setTimeout(() => syncUnpack(this), 0);
       }
@@ -310,9 +359,12 @@ app.registerExtension({
   },
 
   afterConfigureGraph() {
-    for (const node of app.graph?._nodes || []) {
-      if (isNode(node, PACK) || isNode(node, UNPACK)) {
-        setupNode(node);
+    const rootGraph = app.graph?.rootGraph || app.graph;
+    for (const graph of graphsFor(rootGraph)) {
+      for (const node of nodesFor(graph)) {
+        if (isNode(node, PACK) || isNode(node, UNPACK)) {
+          setupNode(node);
+        }
       }
     }
   },

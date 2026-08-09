@@ -6,7 +6,6 @@
 
 <img width="1324" height="645" alt="image" src="https://github.com/user-attachments/assets/0a07fa5e-98ab-460a-a17f-9345277a432c" />
 
-
 ## ノード
 
 - `to Dynamic Pipe`: IMAGE、MODEL、LATENT、STRINGなどをまとめて出力します。
@@ -24,7 +23,10 @@
 `dynamic_pipe`を`from Dynamic Pipe`から外しても最後の出力構成は残るため、後続ノードへの配線は維持されます。別の`to Dynamic Pipe`へつなぎ替えて名前または型が変わった出力については、誤接続を防ぐため後続の配線が解除されます。
 
 ## インストール
+
+```shell
+cd ComfyUI/custom_nodes
+git clone https://github.com/palealloy2999-prog/ComfyUI-DynamicPipe.git
 ```
-cd ComfyUI/custom_nondes
-git clone https://github.com/palealloy2999-prog/ComfyUI-DynamicPipe
-```
+
+ComfyUIを再起動し、ブラウザを再読み込みしてください。追加依存関係はありません。
