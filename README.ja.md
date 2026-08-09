@@ -4,6 +4,9 @@
 
 任意の型・任意の本数の値を1本のpipeにまとめ、別のノードで展開するComfyUIカスタムノードです。
 
+<img width="1324" height="645" alt="image" src="https://github.com/user-attachments/assets/0a07fa5e-98ab-460a-a17f-9345277a432c" />
+
+
 ## ノード
 
 - `to Dynamic Pipe`: IMAGE、MODEL、LATENT、STRINGなどをまとめて出力します。
