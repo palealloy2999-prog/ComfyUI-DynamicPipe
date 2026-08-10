@@ -105,17 +105,16 @@ function uniqueLabel(node, desired, currentInput) {
 }
 
 
-function sourceDetails(node, linkInfo, connectedSlot) {
+function sourceDetails(node, linkInfo) {
   const graph = graphFor(node);
   const origin = graph?.getNodeById(linkInfo?.origin_id);
   const output =
     origin?.outputs?.[linkInfo?.origin_slot] ||
     origin?.slots?.[linkInfo?.origin_slot] ||
     origin?.allSlots?.[linkInfo?.origin_slot] ||
-    graph?.inputNode?.slots?.[linkInfo?.origin_slot] ||
-    connectedSlot;
+    graph?.inputNode?.slots?.[linkInfo?.origin_slot];
   if (!output) {
-    return { name: "value", type: String(linkInfo?.type || "*") };
+    return null;
   }
 
   const name =
@@ -265,30 +264,41 @@ function updatePack(node) {
 }
 
 
-function configurePackInput(node, slotIndex, connected, linkInfo, connectedSlot) {
+function configurePackInput(node, slotIndex, connected, linkInfo) {
   const input = node.inputs?.[slotIndex];
   if (!input) {
     return;
   }
 
   if (connected) {
-    const source = sourceDetails(node, linkInfo, connectedSlot);
+    const source = sourceDetails(node, linkInfo);
+    if (!source) {
+      return;
+    }
     input.label = uniqueLabel(node, source.name, input);
     input.type = source.type;
     input.dynamicPipeType = source.type;
     input.dynamicPipeConfigured = true;
-  } else if (isConfiguredInput(input)) {
+  } else {
+    input.label = "*";
     input.type = "*";
+    input.dynamicPipeConfigured = false;
   }
   updatePack(node);
 }
 
 
-function setupNode(node) {
+function setupNode(node, removeDisconnected = false) {
   hideSchemaWidget(node);
   if (isNode(node, PACK)) {
     const savedFields = new Map(parseWidgetSchema(node).map((field) => [field.key, field]));
     for (const input of node.inputs || []) {
+      if (removeDisconnected && input.link == null) {
+        input.label = "*";
+        input.type = "*";
+        input.dynamicPipeConfigured = false;
+        continue;
+      }
       const field = savedFields.get(input.name);
       if (field) {
         input.label = field.name;
@@ -309,6 +319,9 @@ function setupNode(node) {
       }
       const link = linkFor(graphFor(node), input.link);
       const source = sourceDetails(node, link);
+      if (!source) {
+        continue;
+      }
       input.label = uniqueLabel(node, source.name, input);
       input.type = source.type;
       input.dynamicPipeType = source.type;
@@ -331,14 +344,14 @@ app.registerExtension({
     }
 
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
-    nodeType.prototype.onConnectionsChange = function (type, slotIndex, connected, linkInfo, connectedSlot) {
+    nodeType.prototype.onConnectionsChange = function (type, slotIndex, connected, linkInfo) {
       const result = onConnectionsChange?.apply(this, arguments);
-      if (type !== LiteGraph.INPUT) {
+      if (type !== LiteGraph.INPUT || app.configuringGraph) {
         return result;
       }
 
       if (nodeData.name === PACK) {
-        setTimeout(() => configurePackInput(this, slotIndex, connected, linkInfo, connectedSlot), 0);
+        setTimeout(() => configurePackInput(this, slotIndex, connected, linkInfo), 0);
       } else if (connected && slotIndex === 0) {
         setTimeout(() => syncUnpack(this), 0);
       }
@@ -363,7 +376,7 @@ app.registerExtension({
     for (const graph of graphsFor(rootGraph)) {
       for (const node of nodesFor(graph)) {
         if (isNode(node, PACK) || isNode(node, UNPACK)) {
-          setupNode(node);
+          setupNode(node, true);
         }
       }
     }
