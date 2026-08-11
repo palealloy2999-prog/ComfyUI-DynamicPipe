@@ -51,9 +51,7 @@ class ToDynamicPipe:
             "required": {
                 "_schema": (IO.STRING, {"default": "[]", "socketless": True, "hidden": True}),
             },
-            "optional": FlexibleInputs({
-                "value_1": (IO.ANY, {"forceInput": True, "display_name": "*"}),
-            }),
+            "optional": FlexibleInputs(),
         }
 
     RETURN_TYPES = (PIPE_TYPE,)

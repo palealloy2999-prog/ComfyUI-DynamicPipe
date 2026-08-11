@@ -5,6 +5,7 @@ const PACK = "ToDynamicPipe";
 const UNPACK = "FromDynamicPipe";
 const PIPE_TYPE = "DYNAMIC_PIPE";
 const SCHEMA_WIDGET = "_schema";
+const CONFIGURING = Symbol("dynamicPipeConfiguring");
 
 
 function isNode(node, type) {
@@ -220,7 +221,11 @@ function resizeNode(node) {
 }
 
 
-function applySchemaToUnpack(node, schema) {
+function applySchemaToUnpack(node, schema, preserveLinks = false) {
+  if (preserveLinks && schema.length < (node.outputs?.length || 0)) {
+    return;
+  }
+
   for (let index = 0; index < schema.length; index++) {
     const field = schema[index];
     let output = node.outputs?.[index];
@@ -228,7 +233,7 @@ function applySchemaToUnpack(node, schema) {
       output = node.addOutput(field.name, field.type);
     } else {
       const changed = output.name !== field.name || String(output.type) !== field.type;
-      if (changed && output.links?.length) {
+      if (!preserveLinks && changed && output.links?.length) {
         node.disconnectOutput(index);
       }
       output.name = field.name;
@@ -239,7 +244,7 @@ function applySchemaToUnpack(node, schema) {
     updateLinkType(node, output, field.type);
   }
 
-  while ((node.outputs?.length || 0) > schema.length) {
+  while (!preserveLinks && (node.outputs?.length || 0) > schema.length) {
     const index = node.outputs.length - 1;
     if (node.outputs[index].links?.length) {
       node.disconnectOutput(index);
@@ -282,29 +287,29 @@ function upstreamPack(node) {
 }
 
 
-function syncUnpack(node) {
+function syncUnpack(node, preserveLinks = false) {
   const pack = upstreamPack(node);
   if (pack) {
-    applySchemaToUnpack(node, readPackSchema(pack));
+    applySchemaToUnpack(node, readPackSchema(pack), preserveLinks);
   }
 }
 
 
-function notifyConnectedUnpacks(pack) {
+function notifyConnectedUnpacks(pack, preserveLinks = false) {
   for (const node of nodesFor(graphFor(pack))) {
     if (isNode(node, UNPACK) && upstreamPack(node) === pack) {
-      applySchemaToUnpack(node, readPackSchema(pack));
+      applySchemaToUnpack(node, readPackSchema(pack), preserveLinks);
     }
   }
 }
 
 
-function updatePack(node) {
+function updatePack(node, preserveUnpackLinks = false) {
   ensureEmptyInput(node);
   const schema = readPackSchema(node);
   setSchemaWidget(node, schema);
   resizeNode(node);
-  notifyConnectedUnpacks(node);
+  notifyConnectedUnpacks(node, preserveUnpackLinks);
 }
 
 
@@ -323,7 +328,7 @@ function configurePackInput(node, slotIndex, connected, linkInfo) {
     const liveLink = graphLink || linkInfo;
     const source = sourceDetails(node, liveLink);
     if (!source) {
-      updatePack(node);
+      updatePack(node, true);
       return;
     }
     input.label = uniqueLabel(node, source.name, input);
@@ -336,7 +341,7 @@ function configurePackInput(node, slotIndex, connected, linkInfo) {
     input.dynamicPipeConfigured = false;
     pruneEmptyInputs(node);
   }
-  updatePack(node);
+  updatePack(node, connected);
 }
 
 
@@ -376,10 +381,10 @@ function setupNode(node) {
       input.dynamicPipeType = source.type;
       input.dynamicPipeConfigured = true;
     }
-    updatePack(node);
+    updatePack(node, true);
   } else if (isNode(node, UNPACK)) {
-    applySchemaToUnpack(node, parseWidgetSchema(node));
-    syncUnpack(node);
+    applySchemaToUnpack(node, parseWidgetSchema(node), true);
+    syncUnpack(node, true);
   }
 }
 
@@ -392,12 +397,33 @@ app.registerExtension({
       return;
     }
 
+    const configure = nodeType.prototype.configure;
+    nodeType.prototype.configure = function () {
+      this[CONFIGURING] = true;
+      let configured = false;
+      try {
+        const result = configure.apply(this, arguments);
+        configured = true;
+        return result;
+      } finally {
+        this[CONFIGURING] = false;
+        if (configured) {
+          setTimeout(() => {
+            if (this.graph) {
+              setupNode(this);
+            }
+          }, 0);
+        }
+      }
+    };
+
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function (type, slotIndex, connected, linkInfo) {
       const result = onConnectionsChange?.apply(this, arguments);
       if (
         type !== LiteGraph.INPUT ||
         app.configuringGraph ||
+        this[CONFIGURING] ||
         (!connected && !isActiveNode(this))
       ) {
         return result;
@@ -406,7 +432,7 @@ app.registerExtension({
       if (nodeData.name === PACK) {
         setTimeout(() => configurePackInput(this, slotIndex, connected, linkInfo), 0);
       } else if (connected && slotIndex === 0) {
-        setTimeout(() => syncUnpack(this), 0);
+        setTimeout(() => syncUnpack(this, true), 0);
       }
       return result;
     };
@@ -415,7 +441,7 @@ app.registerExtension({
       const onConnectInput = nodeType.prototype.onConnectInput;
       nodeType.prototype.onConnectInput = function (slotIndex) {
         const result = onConnectInput?.apply(this, arguments);
-        if (result !== false && !app.configuringGraph) {
+        if (result !== false && !app.configuringGraph && !this[CONFIGURING]) {
           requestAnimationFrame(() => {
             const input = this.inputs?.[slotIndex];
             if (input?.link != null) {

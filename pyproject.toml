@@ -1,7 +1,7 @@
 [project]
 name = "dynamicpipe"
 description = "Pack and unpack any number of typed values through a dynamic pipe in ComfyUI."
-version = "1.0.2"
+version = "2.0.0"
 license = { text = "MIT License" }
 dependencies = []
 classifiers = [
