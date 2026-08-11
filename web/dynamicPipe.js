@@ -17,6 +17,17 @@ function graphFor(node) {
 }
 
 
+function rootGraphFor(graph) {
+  return graph?.rootGraph || graph;
+}
+
+
+function isActiveNode(node) {
+  const activeRoot = app.rootGraph || rootGraphFor(app.graph);
+  return !activeRoot || rootGraphFor(graphFor(node)) === activeRoot;
+}
+
+
 function linkFor(graph, linkId) {
   return graph?.getLink?.(linkId) || graph?.links?.[linkId];
 }
@@ -53,8 +64,13 @@ function hideSchemaWidget(node) {
 }
 
 
+function isPlaceholderInput(input) {
+  return /^\*(?:_\d+)?$/.test(String(input?.label || "*"));
+}
+
+
 function isConfiguredInput(input) {
-  return input?.dynamicPipeConfigured === true || input?.label !== "*";
+  return input?.dynamicPipeConfigured === true && !isPlaceholderInput(input);
 }
 
 
@@ -78,11 +94,8 @@ function addEmptyInput(node) {
 
 
 function ensureEmptyInput(node) {
-  for (let index = (node.inputs?.length || 0) - 1; index >= 0; index--) {
-    const input = node.inputs[index];
-    if (!isConfiguredInput(input) && input.link == null) {
-      node.removeInput(index);
-    }
+  if ((node.inputs || []).some((input) => !isConfiguredInput(input) && input.link == null)) {
+    return;
   }
   addEmptyInput(node);
 }
@@ -283,22 +296,22 @@ function configurePackInput(node, slotIndex, connected, linkInfo) {
     input.label = "*";
     input.type = "*";
     input.dynamicPipeConfigured = false;
+    for (let index = node.inputs.length - 1; index > slotIndex; index--) {
+      const candidate = node.inputs[index];
+      if (!isConfiguredInput(candidate) && candidate.link == null) {
+        node.removeInput(index);
+      }
+    }
   }
   updatePack(node);
 }
 
 
-function setupNode(node, removeDisconnected = false) {
+function setupNode(node) {
   hideSchemaWidget(node);
   if (isNode(node, PACK)) {
     const savedFields = new Map(parseWidgetSchema(node).map((field) => [field.key, field]));
     for (const input of node.inputs || []) {
-      if (removeDisconnected && input.link == null) {
-        input.label = "*";
-        input.type = "*";
-        input.dynamicPipeConfigured = false;
-        continue;
-      }
       const field = savedFields.get(input.name);
       if (field) {
         input.label = field.name;
@@ -346,7 +359,7 @@ app.registerExtension({
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function (type, slotIndex, connected, linkInfo) {
       const result = onConnectionsChange?.apply(this, arguments);
-      if (type !== LiteGraph.INPUT || app.configuringGraph) {
+      if (type !== LiteGraph.INPUT || app.configuringGraph || !isActiveNode(this)) {
         return result;
       }
 
@@ -372,11 +385,11 @@ app.registerExtension({
   },
 
   afterConfigureGraph() {
-    const rootGraph = app.graph?.rootGraph || app.graph;
+    const rootGraph = app.rootGraph || rootGraphFor(app.graph);
     for (const graph of graphsFor(rootGraph)) {
       for (const node of nodesFor(graph)) {
         if (isNode(node, PACK) || isNode(node, UNPACK)) {
-          setupNode(node, true);
+          setupNode(node);
         }
       }
     }
