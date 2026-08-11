@@ -11,6 +11,8 @@ class FlexibleInputs(dict):
         return True
 
     def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return super().__getitem__(key)
         return (IO.ANY, {"forceInput": True})
 
 
@@ -49,7 +51,9 @@ class ToDynamicPipe:
             "required": {
                 "_schema": (IO.STRING, {"default": "[]", "socketless": True, "hidden": True}),
             },
-            "optional": FlexibleInputs(),
+            "optional": FlexibleInputs({
+                "value_1": (IO.ANY, {"forceInput": True, "display_name": "*"}),
+            }),
         }
 
     RETURN_TYPES = (PIPE_TYPE,)

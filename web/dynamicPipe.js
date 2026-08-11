@@ -69,6 +69,11 @@ function isPlaceholderInput(input) {
 }
 
 
+function isPackValueInput(input) {
+  return /^value_\d+$/.test(String(input?.name || ""));
+}
+
+
 function isConfiguredInput(input) {
   return input?.dynamicPipeConfigured === true && !isPlaceholderInput(input);
 }
@@ -87,17 +92,39 @@ function nextInputKey(node) {
 
 
 function addEmptyInput(node) {
-  const input = node.addInput(nextInputKey(node), "*");
+  const key = nextInputKey(node);
+  const input = node.addInput(key, "*");
   input.label = "*";
   input.dynamicPipeConfigured = false;
 }
 
 
-function ensureEmptyInput(node) {
-  if ((node.inputs || []).some((input) => !isConfiguredInput(input) && input.link == null)) {
+function ensureEmptyInput(node, connectedInput = null) {
+  const reusableInput = (node.inputs || []).find(
+    (input) =>
+      isPackValueInput(input) &&
+      input !== connectedInput &&
+      !isConfiguredInput(input) &&
+      input.link == null,
+  );
+  if (reusableInput) {
     return;
   }
   addEmptyInput(node);
+}
+
+
+function pruneEmptyInputs(node) {
+  const emptyInputs = (node.inputs || []).filter(
+    (input) =>
+      isPackValueInput(input) && !isConfiguredInput(input) && input.link == null,
+  );
+  const inputsToRemove = new Set(emptyInputs.slice(1));
+  for (let index = node.inputs.length - 1; index >= 0; index--) {
+    if (inputsToRemove.has(node.inputs[index])) {
+      node.removeInput(index);
+    }
+  }
 }
 
 
@@ -105,7 +132,10 @@ function uniqueLabel(node, desired, currentInput) {
   const base = String(desired || "value").trim() || "value";
   const used = new Set(
     (node.inputs || [])
-      .filter((input) => input !== currentInput && isConfiguredInput(input))
+      .filter(
+        (input) =>
+          isPackValueInput(input) && input !== currentInput && isConfiguredInput(input),
+      )
       .map((input) => String(input.label || input.name).toLocaleLowerCase()),
   );
 
@@ -143,7 +173,7 @@ function sourceDetails(node, linkInfo) {
 
 function readPackSchema(node) {
   return (node.inputs || [])
-    .filter(isConfiguredInput)
+    .filter((input) => isPackValueInput(input) && isConfiguredInput(input))
     .map((input) => ({
       key: input.name,
       name: String(input.label || input.name),
@@ -271,7 +301,8 @@ function notifyConnectedUnpacks(pack) {
 
 function updatePack(node) {
   ensureEmptyInput(node);
-  setSchemaWidget(node, readPackSchema(node));
+  const schema = readPackSchema(node);
+  setSchemaWidget(node, schema);
   resizeNode(node);
   notifyConnectedUnpacks(node);
 }
@@ -282,10 +313,17 @@ function configurePackInput(node, slotIndex, connected, linkInfo) {
   if (!input) {
     return;
   }
+  if (!isPackValueInput(input)) {
+    return;
+  }
 
   if (connected) {
-    const source = sourceDetails(node, linkInfo);
+    ensureEmptyInput(node, input);
+    const graphLink = linkFor(graphFor(node), input.link);
+    const liveLink = graphLink || linkInfo;
+    const source = sourceDetails(node, liveLink);
     if (!source) {
+      updatePack(node);
       return;
     }
     input.label = uniqueLabel(node, source.name, input);
@@ -296,12 +334,7 @@ function configurePackInput(node, slotIndex, connected, linkInfo) {
     input.label = "*";
     input.type = "*";
     input.dynamicPipeConfigured = false;
-    for (let index = node.inputs.length - 1; index > slotIndex; index--) {
-      const candidate = node.inputs[index];
-      if (!isConfiguredInput(candidate) && candidate.link == null) {
-        node.removeInput(index);
-      }
-    }
+    pruneEmptyInputs(node);
   }
   updatePack(node);
 }
@@ -312,6 +345,9 @@ function setupNode(node) {
   if (isNode(node, PACK)) {
     const savedFields = new Map(parseWidgetSchema(node).map((field) => [field.key, field]));
     for (const input of node.inputs || []) {
+      if (!isPackValueInput(input)) {
+        continue;
+      }
       const field = savedFields.get(input.name);
       if (field) {
         input.label = field.name;
@@ -327,7 +363,7 @@ function setupNode(node) {
       }
     }
     for (const input of node.inputs || []) {
-      if (input.link == null) {
+      if (!isPackValueInput(input) || input.link == null) {
         continue;
       }
       const link = linkFor(graphFor(node), input.link);
@@ -359,7 +395,11 @@ app.registerExtension({
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function (type, slotIndex, connected, linkInfo) {
       const result = onConnectionsChange?.apply(this, arguments);
-      if (type !== LiteGraph.INPUT || app.configuringGraph || !isActiveNode(this)) {
+      if (
+        type !== LiteGraph.INPUT ||
+        app.configuringGraph ||
+        (!connected && !isActiveNode(this))
+      ) {
         return result;
       }
 
@@ -370,6 +410,22 @@ app.registerExtension({
       }
       return result;
     };
+
+    if (nodeData.name === PACK) {
+      const onConnectInput = nodeType.prototype.onConnectInput;
+      nodeType.prototype.onConnectInput = function (slotIndex) {
+        const result = onConnectInput?.apply(this, arguments);
+        if (result !== false && !app.configuringGraph) {
+          requestAnimationFrame(() => {
+            const input = this.inputs?.[slotIndex];
+            if (input?.link != null) {
+              configurePackInput(this, slotIndex, true, linkFor(graphFor(this), input.link));
+            }
+          });
+        }
+        return result;
+      };
+    }
   },
 
   nodeCreated(node) {
