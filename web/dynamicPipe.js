@@ -6,6 +6,9 @@ const UNPACK = "FromDynamicPipe";
 const PIPE_TYPE = "DYNAMIC_PIPE";
 const SCHEMA_WIDGET = "_schema";
 const CONFIGURING = Symbol("dynamicPipeConfiguring");
+const VIRTUAL_WATCHERS = Symbol("dynamicPipeVirtualWatchers");
+const VIRTUAL_RENAME_WRAPPED = Symbol("dynamicPipeVirtualRenameWrapped");
+const WATCHED_VIRTUALS = Symbol("dynamicPipeWatchedVirtuals");
 
 
 function isNode(node, type) {
@@ -222,6 +225,23 @@ function updateLinkType(node, output, type) {
 }
 
 
+function isDynamicPipeOutput(outputType, output) {
+  return String(output?.type ?? outputType) === PIPE_TYPE;
+}
+
+
+function rejectInvalidUnpackInput(node) {
+  const input = node.inputs?.[0];
+  const graph = graphFor(node);
+  const link = linkFor(graph, input?.link);
+  const origin = graph?.getNodeById(link?.origin_id);
+  const output = origin?.outputs?.[link?.origin_slot];
+  if (input?.link != null && !isDynamicPipeOutput(link?.type, output)) {
+    node.disconnectInput(0);
+  }
+}
+
+
 function resizeNode(node) {
   const computed = node.computeSize();
   node.setSize([Math.max(node.size[0], computed[0]), computed[1]]);
@@ -265,7 +285,73 @@ function applySchemaToUnpack(node, schema, preserveLinks = false) {
 }
 
 
+function clearVirtualWatches(node) {
+  for (const virtualNode of node[WATCHED_VIRTUALS] || []) {
+    virtualNode[VIRTUAL_WATCHERS]?.delete(node);
+  }
+  node[WATCHED_VIRTUALS]?.clear();
+}
+
+
+function watchVirtualNode(node, virtualNode) {
+  const watched = node[WATCHED_VIRTUALS] ||= new Set();
+  if (watched.has(virtualNode)) {
+    return;
+  }
+
+  watched.add(virtualNode);
+  const watchers = virtualNode[VIRTUAL_WATCHERS] ||= new Set();
+  watchers.add(node);
+
+  if (virtualNode[VIRTUAL_RENAME_WRAPPED] || typeof virtualNode.onRename !== "function") {
+    return;
+  }
+
+  const onRename = virtualNode.onRename;
+  virtualNode.onRename = function () {
+    const result = onRename.apply(this, arguments);
+    setTimeout(() => {
+      for (const unpack of [...(this[VIRTUAL_WATCHERS] || [])]) {
+        if (unpack.graph) {
+          syncUnpack(unpack);
+        } else {
+          this[VIRTUAL_WATCHERS].delete(unpack);
+        }
+      }
+    }, 0);
+    return result;
+  };
+  virtualNode[VIRTUAL_RENAME_WRAPPED] = true;
+}
+
+
+function virtualOutputSource(node, slot) {
+  const graph = graphFor(node);
+  try {
+    const inputLink = node.getInputLink?.(slot);
+    const link = typeof inputLink === "object" ? inputLink : linkFor(graph, inputLink);
+    const origin = graph?.getNodeById(link?.origin_id);
+    if (origin) {
+      return { node: origin, slot: link.origin_slot };
+    }
+  } catch {
+    // An unconfigured third-party virtual node may reject source resolution.
+  }
+
+  try {
+    const source = node.resolveVirtualOutput?.(slot);
+    if (source?.node) {
+      return { node: source.node, slot: source.slot };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+
 function upstreamPack(node) {
+  clearVirtualWatches(node);
   const visited = new Set();
   let current = node;
   let input = current.inputs?.find((slot) => slot.name === "dynamic_pipe") || current.inputs?.[0];
@@ -273,23 +359,42 @@ function upstreamPack(node) {
   while (input?.link != null) {
     const graph = graphFor(current);
     const link = linkFor(graph, input.link);
-    const origin = graph?.getNodeById(link?.origin_id);
-    if (!origin || visited.has(origin.id)) {
+    let origin = graph?.getNodeById(link?.origin_id);
+    let originSlot = link?.origin_slot;
+    if (!origin) {
       return null;
-    }
-    if (isNode(origin, PACK)) {
-      return origin;
     }
 
-    visited.add(origin.id);
-    const pipeInputs = (origin.inputs || []).filter(
-      (slot) => slot.link != null && String(slot.type) === PIPE_TYPE,
-    );
-    if (pipeInputs.length !== 1) {
-      return null;
+    while (origin) {
+      if (visited.has(origin)) {
+        return null;
+      }
+      visited.add(origin);
+
+      if (isNode(origin, PACK)) {
+        return origin;
+      }
+
+      if (origin.isVirtualNode) {
+        watchVirtualNode(node, origin);
+        const source = virtualOutputSource(origin, originSlot);
+        if (source) {
+          origin = source.node;
+          originSlot = source.slot;
+          continue;
+        }
+      }
+
+      const pipeInputs = (origin.inputs || []).filter(
+        (slot) => slot.link != null && String(slot.type) === PIPE_TYPE,
+      );
+      if (pipeInputs.length !== 1) {
+        return null;
+      }
+      current = origin;
+      input = pipeInputs[0];
+      break;
     }
-    current = origin;
-    input = pipeInputs[0];
   }
   return null;
 }
@@ -440,11 +545,37 @@ app.registerExtension({
 
       if (nodeData.name === PACK) {
         setTimeout(() => configurePackInput(this, slotIndex, connected, linkInfo), 0);
-      } else if (connected && slotIndex === 0) {
-        setTimeout(() => syncUnpack(this, true), 0);
+      } else if (slotIndex === 0) {
+        if (connected) {
+          setTimeout(() => {
+            rejectInvalidUnpackInput(this);
+            if (this.inputs?.[0]?.link != null) {
+              syncUnpack(this, true);
+            }
+          }, 0);
+        } else {
+          clearVirtualWatches(this);
+        }
       }
       return result;
     };
+
+    if (nodeData.name === UNPACK) {
+      const onRemoved = nodeType.prototype.onRemoved;
+      nodeType.prototype.onRemoved = function () {
+        clearVirtualWatches(this);
+        return onRemoved?.apply(this, arguments);
+      };
+
+      const onConnectInput = nodeType.prototype.onConnectInput;
+      nodeType.prototype.onConnectInput = function (slotIndex, outputType, output) {
+        const result = onConnectInput?.apply(this, arguments);
+        if (result === false) {
+          return false;
+        }
+        return slotIndex !== 0 || isDynamicPipeOutput(outputType, output);
+      };
+    }
 
     if (nodeData.name === PACK) {
       const onConnectInput = nodeType.prototype.onConnectInput;
