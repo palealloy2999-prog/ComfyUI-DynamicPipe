@@ -62,11 +62,10 @@ class ToDynamicPipe:
 
     def pack(self, _schema="[]", **kwargs):
         schema = parse_schema(_schema)
-        missing = [field["name"] for field in schema if field["key"] not in kwargs]
-        if missing:
-            raise ValueError(f"Dynamic Pipe Pack inputs are not connected: {', '.join(missing)}")
-
-        values = {field["key"]: kwargs[field["key"]] for field in schema}
+        values = {
+            field["key"]: kwargs.get(field["key"])
+            for field in schema
+        }
         return ({"dynamic_pipe": True, "schema": schema, "values": values},)
 
 
