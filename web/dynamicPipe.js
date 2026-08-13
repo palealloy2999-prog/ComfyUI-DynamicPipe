@@ -55,13 +55,21 @@ function schemaWidget(node) {
 
 function hideSchemaWidget(node) {
   const widget = schemaWidget(node);
-  if (!widget || widget.dynamicPipeHidden) {
+  if (!widget) {
     return;
   }
 
-  widget.dynamicPipeHidden = true;
-  widget.hidden = true;
-  widget.computeSize = () => [0, -4];
+  if (!widget.dynamicPipeHidden) {
+    widget.dynamicPipeHidden = true;
+    widget.hidden = true;
+    widget.computeSize = () => [0, -4];
+  }
+
+  const inputIndex = node.inputs?.findIndex((input) => input.name === SCHEMA_WIDGET) ?? -1;
+  if (inputIndex !== -1) {
+    node.removeInput(inputIndex);
+    node._setConcreteSlots?.();
+  }
 }
 
 
@@ -408,6 +416,7 @@ app.registerExtension({
       } finally {
         this[CONFIGURING] = false;
         if (configured) {
+          hideSchemaWidget(this);
           setTimeout(() => {
             if (this.graph) {
               setupNode(this);
