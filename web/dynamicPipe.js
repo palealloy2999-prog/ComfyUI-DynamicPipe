@@ -550,7 +550,7 @@ app.registerExtension({
           setTimeout(() => {
             rejectInvalidUnpackInput(this);
             if (this.inputs?.[0]?.link != null) {
-              syncUnpack(this, true);
+              syncUnpack(this);
             }
           }, 0);
         } else {
