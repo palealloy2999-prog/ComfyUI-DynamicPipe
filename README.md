@@ -20,6 +20,10 @@ A pair of ComfyUI custom nodes that packs any number of values of any type into 
 
 Each input adopts the name of its connected upstream output. Duplicate names receive a numeric suffix such as `_2` or `_3`.
 
+## Subgraph support
+
+Dynamic Pipe preserves the schema for each subgraph instance. When a value enters a subgraph, its input-slot name is retained in the pipe schema, so fields such as `positive` and `negative` remain distinct even when both receive `CONDITIONING`. The slot name and type are also retained when the parent-side connection is temporarily disconnected.
+
 Disconnecting `dynamic_pipe` from `from Dynamic Pipe` preserves its last output layout and downstream connections. When it is connected to a different `to Dynamic Pipe`, downstream links are removed only from outputs whose name or type changed, preventing values from being routed incorrectly.
 
 ## Installation
