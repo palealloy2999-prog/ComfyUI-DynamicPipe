@@ -9,6 +9,12 @@ const CONFIGURING = Symbol("dynamicPipeConfiguring");
 const VIRTUAL_WATCHERS = Symbol("dynamicPipeVirtualWatchers");
 const VIRTUAL_RENAME_WRAPPED = Symbol("dynamicPipeVirtualRenameWrapped");
 const WATCHED_VIRTUALS = Symbol("dynamicPipeWatchedVirtuals");
+const SCHEMA_SERIALIZER = Symbol("dynamicPipeSchemaSerializer");
+const BOUNDARY_CONNECTION_WRAPPED = Symbol("dynamicPipeBoundaryConnectionWrapped");
+const PACK_PRESENTATION_SIGNATURE = Symbol("dynamicPipePackPresentationSignature");
+const PACK_PRESENTATION_PENDING = Symbol("dynamicPipePackPresentationPending");
+const INSTANCE_STATE_VERSION = 1;
+const WORKFLOW_BINDINGS = new WeakMap();
 
 
 function isNode(node, type) {
@@ -163,6 +169,9 @@ function uniqueLabel(node, desired, currentInput) {
 function sourceDetails(node, linkInfo) {
   const graph = graphFor(node);
   const origin = graph?.getNodeById(linkInfo?.origin_id);
+  if (!origin && linkInfo?.origin_id != null) {
+    return null;
+  }
   const output =
     origin?.outputs?.[linkInfo?.origin_slot] ||
     origin?.slots?.[linkInfo?.origin_slot] ||
@@ -179,7 +188,7 @@ function sourceDetails(node, linkInfo) {
     output.name ||
     output.type ||
     "value";
-  return { name: String(name), type: String(linkInfo?.type || output.type || "*") };
+  return { name: String(name), type: String(output.type || linkInfo?.type || "*") };
 }
 
 
@@ -209,6 +218,288 @@ function parseWidgetSchema(node) {
   } catch {
     return [];
   }
+}
+
+
+function normalizeSchema(schema) {
+  if (!Array.isArray(schema)) {
+    return [];
+  }
+  return schema
+    .filter((field) => field && field.key != null)
+    .map((field) => ({
+      key: String(field.key),
+      name: String(field.name || field.key),
+      type: String(field.type || "*"),
+    }));
+}
+
+
+function instanceState(rootGraph, create = true) {
+  if (!rootGraph) {
+    return null;
+  }
+  const extra = rootGraph.extra || (create ? (rootGraph.extra = {}) : null);
+  if (!extra) {
+    return null;
+  }
+  let state = extra.dynamicPipe;
+  if (!state || state.version !== INSTANCE_STATE_VERSION || !state.schemas) {
+    if (!create) {
+      return null;
+    }
+    state = { version: INSTANCE_STATE_VERSION, schemas: {} };
+    extra.dynamicPipe = state;
+  }
+  return state;
+}
+
+
+function cachedSchema(rootGraph, executionId) {
+  const value = instanceState(rootGraph, false)?.schemas?.[String(executionId)];
+  return normalizeSchema(value);
+}
+
+
+function cacheSchema(rootGraph, executionId, schema) {
+  if (executionId == null) {
+    return;
+  }
+  instanceState(rootGraph).schemas[String(executionId)] = normalizeSchema(schema);
+}
+
+
+function executionNode(value) {
+  return value?.node || value;
+}
+
+
+function executionIdFor(path, node) {
+  return [...path, node.id].join(":");
+}
+
+
+function outputDetails(output, fallbackType = "*") {
+  if (!output) {
+    return null;
+  }
+  const name =
+    output.displayName ||
+    output.label ||
+    output.localized_name ||
+    output.name ||
+    output.type ||
+    "value";
+  return { name: String(name), type: String(output.type || fallbackType || "*") };
+}
+
+
+function uniqueSchemaName(fields, desired) {
+  const base = String(desired || "value").trim() || "value";
+  const used = new Set(fields.map((field) => field.name.toLocaleLowerCase()));
+  let name = base;
+  let suffix = 2;
+  while (used.has(name.toLocaleLowerCase())) {
+    name = `${base}_${suffix++}`;
+  }
+  return name;
+}
+
+
+function resolvedSourceDetails(resolved) {
+  const source = executionNode(resolved?.node);
+  const slot = resolved?.origin_slot;
+  const output =
+    source?.outputs?.[slot] || source?.slots?.[slot] || source?.allSlots?.[slot];
+  return outputDetails(output, resolved?.type);
+}
+
+
+function dtoInstancePath(executableNode) {
+  if (Array.isArray(executableNode?.subgraphNodePath)) {
+    return [...executableNode.subgraphNodePath];
+  }
+  return [];
+}
+
+
+function parentInstance(rootGraph, path) {
+  if (!path?.length) {
+    return null;
+  }
+  const parentPath = path.slice(0, -1);
+  const graph = graphAtPath(rootGraph, parentPath);
+  const node = graph?.getNodeById?.(path[path.length - 1]);
+  return node ? { graph, node, path: parentPath } : null;
+}
+
+
+function resolvePhysicalOutput(rootGraph, graph, node, slot, path, visited) {
+  if (!node) {
+    return null;
+  }
+  const visitKey = `${path.join(":")}|${node.id}|${slot}`;
+  if (visited.has(visitKey)) {
+    return null;
+  }
+  visited.add(visitKey);
+
+  if (node.mode === 2) {
+    return null;
+  }
+  if (node.mode === 4) {
+    const input = node.inputs?.[slot]?.link != null
+      ? node.inputs[slot]
+      : node.inputs?.find((candidate) => candidate.link != null);
+    return input
+      ? resolvePhysicalLink(rootGraph, graph, linkFor(graph, input.link), path, visited)
+      : null;
+  }
+
+  if (node.isSubgraphNode?.() || node.subgraph) {
+    const source = enterSubgraphOutput(node, slot);
+    return source
+      ? resolvePhysicalOutput(
+          rootGraph,
+          node.subgraph,
+          source.node,
+          source.slot,
+          [...path, node.id],
+          visited,
+        )
+      : null;
+  }
+
+  if (node.isVirtualNode) {
+    const source = virtualOutputSource(node, slot);
+    return source
+      ? resolvePhysicalOutput(rootGraph, graphFor(source.node), source.node, source.slot, path, visited)
+      : null;
+  }
+
+  const output =
+    node.outputs?.[slot] || node.slots?.[slot] || node.allSlots?.[slot];
+  return outputDetails(output);
+}
+
+
+function resolvePhysicalLink(rootGraph, graph, link, path, visited = new Set()) {
+  if (!link) {
+    return null;
+  }
+  const isInputBoundary = Boolean(
+    link.originIsIoNode ||
+    link.origin_id === -10 ||
+    link.origin_id === graph?.inputNode?.id
+  );
+  if (isInputBoundary) {
+    const parent = parentInstance(rootGraph, path);
+    const parentInput = parent?.node?.inputs?.[link.origin_slot];
+    const outerLink = linkFor(parent?.graph, parentInput?.link);
+    return parent
+      ? resolvePhysicalLink(rootGraph, parent.graph, outerLink, parent.path, visited)
+      : null;
+  }
+
+  const origin = graph?.getNodeById?.(link.origin_id);
+  return resolvePhysicalOutput(
+    rootGraph,
+    graph,
+    origin,
+    link.origin_slot,
+    path,
+    visited,
+  );
+}
+
+
+function derivePackSchemaFromContext(rootGraph, node, path) {
+  const executionId = executionIdFor(path, node);
+  const fallback = new Map([
+    ...parseWidgetSchema(node),
+    ...cachedSchema(rootGraph, executionId),
+  ].map((field) => [String(field.key), field]));
+  const schema = [];
+  let complete = true;
+
+  for (const input of node.inputs || []) {
+    if (!isPackValueInput(input) || input.link == null) {
+      continue;
+    }
+    const details = resolvePhysicalLink(
+      rootGraph,
+      graphFor(node),
+      linkFor(graphFor(node), input.link),
+      path,
+    );
+    const previous = fallback.get(String(input.name));
+    const field = details || previous;
+    if (!details) {
+      complete = false;
+    }
+    if (!field) {
+      continue;
+    }
+    schema.push({
+      key: String(input.name),
+      name: uniqueSchemaName(schema, field.name),
+      type: String(field.type || "*"),
+    });
+  }
+  return { schema: normalizeSchema(schema), complete };
+}
+
+
+function derivePackSchema(executableNode) {
+  const node = executionNode(executableNode);
+  const root = rootGraphFor(graphFor(node));
+  const executionId = String(executableNode?.id ?? node?.id ?? "");
+  const fallback = new Map([
+    ...parseWidgetSchema(node),
+    ...cachedSchema(root, executionId),
+  ].map((field) => [String(field.key), field]));
+  const schema = [];
+  let complete = true;
+
+  for (let index = 0; index < (node?.inputs?.length || 0); index++) {
+    const input = node.inputs[index];
+    if (!isPackValueInput(input)) {
+      continue;
+    }
+    const connected = input.link != null || executableNode?.inputs?.[index]?.linkId != null;
+    if (!connected) {
+      continue;
+    }
+
+    let details = null;
+    try {
+      // Dynamic Pack inputs accept every type. Passing an explicit wildcard is
+      // essential here: the slot can have an instance-specific display type,
+      // which must not constrain DTO traversal through bypass nodes.
+      details = resolvedSourceDetails(
+        executableNode?.resolveInput?.(index, new Set(), "*"),
+      );
+    } catch {
+      // A temporarily incomplete subgraph can fail resolution while it is edited.
+    }
+    const previous = fallback.get(String(input.name));
+    if (!details) {
+      complete = false;
+      details = previous || (isConfiguredInput(input) ? {
+        name: input.label || input.name,
+        type: input.dynamicPipeType || input.type || "*",
+      } : null);
+    }
+    if (!details) {
+      continue;
+    }
+    schema.push({
+      key: String(input.name),
+      name: uniqueSchemaName(schema, details.name),
+      type: String(details.type || "*"),
+    });
+  }
+  return { schema: normalizeSchema(schema), complete };
 }
 
 
@@ -250,37 +541,69 @@ function resizeNode(node) {
 
 
 function applySchemaToUnpack(node, schema, preserveLinks = false) {
+  schema = normalizeSchema(schema);
   if (preserveLinks && schema.length < (node.outputs?.length || 0)) {
     return;
   }
 
-  for (let index = 0; index < schema.length; index++) {
-    const field = schema[index];
-    let output = node.outputs?.[index];
+  const oldSchema = normalizeSchema(parseWidgetSchema(node));
+  for (let index = 0; index < (node.outputs?.length || 0); index++) {
+    const output = node.outputs[index];
+    output.dynamicPipeKey ||= oldSchema[index]?.key;
+  }
+
+  const existing = new Map(
+    (node.outputs || [])
+      .filter((output) => output.dynamicPipeKey != null)
+      .map((output) => [String(output.dynamicPipeKey), output]),
+  );
+  const desired = [];
+  for (const field of schema) {
+    let output = existing.get(field.key);
     if (!output) {
       output = node.addOutput(field.name, field.type);
-    } else {
-      const changed = output.name !== field.name || String(output.type) !== field.type;
-      if (!preserveLinks && changed && output.links?.length) {
+    } else if (!preserveLinks && String(output.type) !== field.type && output.links?.length) {
+      node.disconnectOutput(node.outputs.indexOf(output));
+    }
+    output.name = field.name;
+    output.label = field.name;
+    output.type = field.type;
+    output.dynamicPipeKey = field.key;
+    desired.push(output);
+  }
+
+  if (!preserveLinks) {
+    const desiredSet = new Set(desired);
+    for (let index = (node.outputs?.length || 0) - 1; index >= 0; index--) {
+      if (desiredSet.has(node.outputs[index])) {
+        continue;
+      }
+      if (node.outputs[index].links?.length) {
         node.disconnectOutput(index);
       }
-      output.name = field.name;
-      output.label = field.name;
-      output.type = field.type;
+      node.removeOutput(index);
     }
-    output.dynamicPipeKey = field.key;
+  }
+
+  if (!preserveLinks || desired.length === (node.outputs?.length || 0)) {
+    node.outputs = desired;
+    const graph = graphFor(node);
+    for (let index = 0; index < desired.length; index++) {
+      for (const linkId of desired[index].links || []) {
+        const link = linkFor(graph, linkId);
+        if (link) {
+          link.origin_slot = index;
+        }
+      }
+    }
+  }
+  for (const field of schema) {
+    const output = desired.find((candidate) => candidate.dynamicPipeKey === field.key);
     updateLinkType(node, output, field.type);
   }
 
-  while (!preserveLinks && (node.outputs?.length || 0) > schema.length) {
-    const index = node.outputs.length - 1;
-    if (node.outputs[index].links?.length) {
-      node.disconnectOutput(index);
-    }
-    node.removeOutput(index);
-  }
-
   setSchemaWidget(node, schema);
+  node._setConcreteSlots?.();
   resizeNode(node);
 }
 
@@ -350,10 +673,92 @@ function virtualOutputSource(node, slot) {
 }
 
 
-function upstreamPack(node) {
+function upstreamPackExecutable(executableNode) {
+  const visited = new Set();
+  let current = executableNode;
+  while (current) {
+    const node = executionNode(current);
+    if (isNode(node, PACK)) {
+      return current;
+    }
+    const inputIndex = (node.inputs || []).findIndex(
+      (input) => input.name === "dynamic_pipe" || String(input.type) === PIPE_TYPE,
+    );
+    if (inputIndex < 0) {
+      return null;
+    }
+    let resolved;
+    try {
+      resolved = current.resolveInput?.(inputIndex);
+    } catch {
+      return null;
+    }
+    current = resolved?.node;
+    const executionId = String(current?.id ?? "");
+    if (!current || visited.has(executionId)) {
+      return null;
+    }
+    visited.add(executionId);
+  }
+  return null;
+}
+
+
+function schemaForExecutableUnpack(executableNode) {
+  const pack = upstreamPackExecutable(executableNode);
+  return pack ? derivePackSchema(pack).schema : [];
+}
+
+
+function installSchemaSerializer(node) {
+  const widget = schemaWidget(node);
+  if (!widget || widget[SCHEMA_SERIALIZER]) {
+    return;
+  }
+  const previous = widget.serializeValue;
+  widget.serializeValue = function (executableNode, widgetIndex) {
+    try {
+      if (executableNode?.id != null && executableNode?.resolveInput) {
+        if (isNode(node, PACK)) {
+          return JSON.stringify(derivePackSchema(executableNode).schema);
+        }
+        const pack = upstreamPackExecutable(executableNode);
+        if (pack) {
+          return JSON.stringify(derivePackSchema(pack).schema);
+        }
+      }
+    } catch (error) {
+      console.warn("DynamicPipe: failed to resolve instance schema", error);
+    }
+    return previous
+      ? previous.call(this, executableNode, widgetIndex)
+      : this.value;
+  };
+  widget[SCHEMA_SERIALIZER] = true;
+}
+
+
+function enterSubgraphOutput(subgraphNode, slot) {
+  try {
+    const resolved = subgraphNode.resolveSubgraphOutputLink?.(slot);
+    if (resolved?.outputNode && resolved?.link) {
+      return {
+        node: resolved.outputNode,
+        slot: resolved.link.origin_slot,
+      };
+    }
+  } catch {
+    // The output can be transiently incomplete while editing the subgraph.
+  }
+  return null;
+}
+
+
+function upstreamPackContext(node, initialPath = []) {
   clearVirtualWatches(node);
   const visited = new Set();
   let current = node;
+  let path = [...initialPath];
   let input = current.inputs?.find((slot) => slot.name === "dynamic_pipe") || current.inputs?.[0];
 
   while (input?.link != null) {
@@ -366,13 +771,29 @@ function upstreamPack(node) {
     }
 
     while (origin) {
-      if (visited.has(origin)) {
+      const visitKey = `${path.join(":")}|${origin.id}|${originSlot}`;
+      if (visited.has(visitKey)) {
         return null;
       }
-      visited.add(origin);
+      visited.add(visitKey);
 
       if (isNode(origin, PACK)) {
-        return origin;
+        return {
+          node: origin,
+          executionId: executionIdFor(path, origin),
+          path,
+        };
+      }
+
+      if (origin.isSubgraphNode?.() || origin.subgraph) {
+        const source = enterSubgraphOutput(origin, originSlot);
+        if (!source) {
+          return null;
+        }
+        path = [...path, origin.id];
+        origin = source.node;
+        originSlot = source.slot;
+        continue;
       }
 
       if (origin.isVirtualNode) {
@@ -400,20 +821,438 @@ function upstreamPack(node) {
 }
 
 
-function syncUnpack(node, preserveLinks = false) {
-  const pack = upstreamPack(node);
-  if (pack) {
-    applySchemaToUnpack(node, readPackSchema(pack), preserveLinks);
+function upstreamPack(node) {
+  return upstreamPackContext(node)?.node || null;
+}
+
+
+function executionDtos(rootGraph) {
+  const result = new Map();
+  for (const node of nodesFor(rootGraph)) {
+    if (!(node.isSubgraphNode?.() || node.subgraph) || !node.getInnerNodes) {
+      continue;
+    }
+    try {
+      for (const dto of node.getInnerNodes(result) || []) {
+        result.set(String(dto.id), dto);
+      }
+    } catch (error) {
+      console.warn("DynamicPipe: failed to enumerate subgraph instances", error);
+    }
+  }
+  return result;
+}
+
+
+function graphAtPath(rootGraph, path) {
+  let graph = rootGraph;
+  for (const id of path || []) {
+    const node = graph?.getNodeById?.(id);
+    if (!(node?.isSubgraphNode?.() || node?.subgraph)) {
+      return null;
+    }
+    graph = node.subgraph;
+  }
+  return graph;
+}
+
+
+function pathsForGraph(rootGraph, targetGraph) {
+  const paths = [];
+  function visit(graph, path, ancestors) {
+    if (graph === targetGraph) {
+      paths.push(path);
+    }
+    if (ancestors.has(graph)) {
+      return;
+    }
+    const nextAncestors = new Set(ancestors).add(graph);
+    for (const node of nodesFor(graph)) {
+      if (node.isSubgraphNode?.() || node.subgraph) {
+        visit(node.subgraph, [...path, node.id], nextAncestors);
+      }
+    }
+  }
+  visit(rootGraph, [], new Set());
+  return paths;
+}
+
+
+function presentationPath(rootGraph, graph, binding) {
+  if (graph === rootGraph) {
+    return [];
+  }
+  if (binding?.activePath && graphAtPath(rootGraph, binding.activePath) === graph) {
+    return binding.activePath;
+  }
+  const paths = pathsForGraph(rootGraph, graph);
+  return paths.length === 1 ? paths[0] : null;
+}
+
+
+function isSubgraphInputLink(node, input) {
+  const graph = graphFor(node);
+  const link = linkFor(graph, input?.link);
+  if (!link) {
+    return false;
+  }
+  return Boolean(
+    link.originIsIoNode ||
+    link.origin_id === -10 ||
+    link.origin_id === graph?.inputNode?.id ||
+    graph?.getNodeById?.(link.origin_id) === graph?.inputNode
+  );
+}
+
+
+function updateInputPresentation(node, input, type, boundaryInput) {
+  const color = LGraphCanvas.link_type_colors[type] || LiteGraph.LINK_COLOR;
+  input.color_on = color;
+  input.color_off = color;
+  const link = linkFor(graphFor(node), input?.link);
+  if (link) {
+    if (!boundaryInput) {
+      link.type = type;
+    }
+    link.color = color;
   }
 }
 
 
-function notifyConnectedUnpacks(pack, preserveLinks = false) {
-  for (const node of nodesFor(graphFor(pack))) {
-    if (isNode(node, UNPACK) && upstreamPack(node) === pack) {
-      applySchemaToUnpack(node, readPackSchema(pack), preserveLinks);
+function applySchemaToPackPresentation(node, schema) {
+  const fields = new Map(normalizeSchema(schema).map((field) => [field.key, field]));
+  for (const input of node.inputs || []) {
+    if (!isPackValueInput(input) || input.link == null) {
+      continue;
+    }
+    const field = fields.get(String(input.name));
+    if (!field) {
+      continue;
+    }
+    const boundaryInput = isSubgraphInputLink(node, input);
+    input.label = field.name;
+    // A subgraph input belongs to the shared definition. Keep its physical
+    // contract wildcard so each instance can resolve a different source type.
+    input.type = boundaryInput ? "*" : field.type;
+    input.dynamicPipeType = field.type;
+    input.dynamicPipeConfigured = true;
+    updateInputPresentation(node, input, field.type, boundaryInput);
+  }
+  ensureEmptyInput(node);
+  resizeNode(node);
+}
+
+
+function refreshVisiblePack(node) {
+  if (app.configuringGraph || graphFor(node) !== app.canvas?.graph) {
+    return;
+  }
+  const root = rootGraphFor(graphFor(node));
+  const binding = WORKFLOW_BINDINGS.get(root);
+  const path = presentationPath(root, graphFor(node), binding);
+  if (!path) {
+    return;
+  }
+  const derived = derivePackSchemaFromContext(root, node, path);
+  if (!derived.complete) {
+    return;
+  }
+  const executionId = executionIdFor(path, node);
+  const signature = `${executionId}|${JSON.stringify(derived.schema)}`;
+  if (node[PACK_PRESENTATION_SIGNATURE] === signature || node[PACK_PRESENTATION_PENDING]) {
+    return;
+  }
+  node[PACK_PRESENTATION_PENDING] = true;
+  setTimeout(() => {
+    node[PACK_PRESENTATION_PENDING] = false;
+    if (!node.graph) {
+      return;
+    }
+    cacheSchema(root, executionId, derived.schema);
+    applySchemaToPackPresentation(node, derived.schema);
+    node[PACK_PRESENTATION_SIGNATURE] = signature;
+
+    for (const candidate of nodesFor(graphFor(node))) {
+      if (!isNode(candidate, UNPACK)) {
+        continue;
+      }
+      const context = upstreamPackContext(candidate, path);
+      if (context?.node === node) {
+        applySchemaToUnpack(candidate, derived.schema);
+      }
+    }
+  }, 0);
+}
+
+
+function watchBoundaryNode(node) {
+  if (node?.[BOUNDARY_CONNECTION_WRAPPED]) {
+    return;
+  }
+  const onConnectionsChange = node.onConnectionsChange;
+  node.onConnectionsChange = function () {
+    const result = onConnectionsChange?.apply(this, arguments);
+    scheduleReconcile(rootGraphFor(graphFor(this)), "active");
+    return result;
+  };
+  node[BOUNDARY_CONNECTION_WRAPPED] = true;
+}
+
+
+function schemaForPackContext(rootGraph, context) {
+  const cached = cachedSchema(rootGraph, context?.executionId);
+  return cached.length ? cached : readPackSchema(context?.node);
+}
+
+
+function attachGraphEvents(rootGraph, binding) {
+  for (const graph of graphsFor(rootGraph)) {
+    if (!graph || binding.observedGraphs.has(graph)) {
+      continue;
+    }
+    binding.observedGraphs.add(graph);
+    if (graph.events?.addEventListener) {
+      for (const eventName of [
+        "subgraph-created",
+        "input-added",
+        "removing-input",
+        "renaming-input",
+        "output-added",
+        "removing-output",
+        "renaming-output",
+      ]) {
+        graph.events.addEventListener(
+          eventName,
+          () => scheduleReconcile(rootGraph, "active"),
+          { signal: binding.controller.signal },
+        );
+      }
+    }
+
+    const previousOnTrigger = graph.onTrigger;
+    const onTrigger = function (event) {
+      const result = previousOnTrigger?.apply(this, arguments);
+      if (event?.type === "node:slot-links:changed") {
+        scheduleReconcile(rootGraph, "active");
+      }
+      return result;
+    };
+    graph.onTrigger = onTrigger;
+    binding.cleanups.push(() => {
+      if (graph.onTrigger === onTrigger) {
+        graph.onTrigger = previousOnTrigger;
+      }
+    });
+  }
+}
+
+
+function reconcileWorkflow(rootGraph, mode = "passive") {
+  if (!rootGraph) {
+    return;
+  }
+  const binding = WORKFLOW_BINDINGS.get(rootGraph);
+  attachGraphEvents(rootGraph, binding || {
+    observedGraphs: new Set(),
+    controller: new AbortController(),
+    cleanups: [],
+  });
+  const preserveLinks = mode !== "active";
+  const dtos = executionDtos(rootGraph);
+  const dtoIdsByNode = new Map();
+
+  for (const graph of graphsFor(rootGraph)) {
+    for (const node of nodesFor(graph)) {
+      if (node.isSubgraphNode?.() || node.subgraph) {
+        watchBoundaryNode(node);
+      }
     }
   }
+
+  for (const dto of dtos.values()) {
+    const node = executionNode(dto);
+    if (!node) {
+      continue;
+    }
+    installSchemaSerializer(node);
+    const ids = dtoIdsByNode.get(node) || [];
+    ids.push(String(dto.id));
+    dtoIdsByNode.set(node, ids);
+    if (isNode(node, PACK)) {
+      const contextual = derivePackSchemaFromContext(
+        rootGraph,
+        node,
+        dtoInstancePath(dto),
+      );
+      const derived = contextual.complete ? contextual : derivePackSchema(dto);
+      if (derived.complete) {
+        cacheSchema(rootGraph, dto.id, derived.schema);
+      }
+    }
+  }
+
+  for (const node of nodesFor(rootGraph)) {
+    if (isNode(node, PACK)) {
+      installSchemaSerializer(node);
+      cacheSchema(rootGraph, node.id, readPackSchema(node));
+    }
+  }
+
+  const presentations = [];
+  for (const [node, ids] of dtoIdsByNode) {
+    const path = presentationPath(rootGraph, graphFor(node), binding);
+    const preferredId = path ? executionIdFor(path, node) : null;
+    const chosenId = preferredId && ids.includes(preferredId)
+      ? preferredId
+      : ids.length === 1 ? ids[0] : null;
+    if (!chosenId) {
+      continue;
+    }
+    const dto = dtos.get(chosenId);
+    presentations.push({ node, dto, path: path || dtoInstancePath(dto), chosenId });
+  }
+
+  // Resolve and cache every visible Pack first so a connected Unpack can use
+  // the same instance schema during this reconciliation pass.
+  for (const presentation of presentations) {
+    const { node, dto, path, chosenId } = presentation;
+    if (!isNode(node, PACK)) {
+      continue;
+    }
+    const contextual = derivePackSchemaFromContext(rootGraph, node, path);
+    const derived = contextual.complete ? contextual : derivePackSchema(dto);
+    if (derived.complete) {
+      cacheSchema(rootGraph, chosenId, derived.schema);
+    }
+    if (derived.schema.length) {
+      applySchemaToPackPresentation(node, derived.schema);
+      node[PACK_PRESENTATION_SIGNATURE] =
+        `${chosenId}|${JSON.stringify(derived.schema)}`;
+    }
+  }
+
+  for (const presentation of presentations) {
+    const { node, dto, path } = presentation;
+    if (!isNode(node, UNPACK)) {
+      continue;
+    }
+    const context = upstreamPackContext(node, path);
+    const contextualSchema = context
+      ? schemaForPackContext(rootGraph, context)
+      : [];
+    const schema = contextualSchema.length
+      ? contextualSchema
+      : schemaForExecutableUnpack(dto);
+    if (schema.length) {
+      applySchemaToUnpack(node, schema, preserveLinks);
+    }
+  }
+
+  for (const node of nodesFor(rootGraph)) {
+    if (!isNode(node, UNPACK)) {
+      continue;
+    }
+    installSchemaSerializer(node);
+    const context = upstreamPackContext(node, []);
+    if (context) {
+      applySchemaToUnpack(node, schemaForPackContext(rootGraph, context), preserveLinks);
+    }
+  }
+}
+
+
+function scheduleReconcile(rootGraph, mode = "active") {
+  if (!rootGraph) {
+    return;
+  }
+  let binding = WORKFLOW_BINDINGS.get(rootGraph);
+  if (!binding) {
+    bindWorkflow(rootGraph);
+    binding = WORKFLOW_BINDINGS.get(rootGraph);
+  }
+  binding.mode = binding.mode === "active" || mode === "active" ? "active" : "passive";
+  if (binding.timer != null) {
+    return;
+  }
+  binding.timer = setTimeout(() => {
+    binding.timer = null;
+    const nextMode = binding.mode;
+    binding.mode = "passive";
+    reconcileWorkflow(rootGraph, nextMode);
+  }, 0);
+}
+
+
+function bindWorkflow(rootGraph) {
+  if (!rootGraph) {
+    return;
+  }
+  const previous = WORKFLOW_BINDINGS.get(rootGraph);
+  previous?.controller.abort();
+  for (const cleanup of previous?.cleanups || []) {
+    cleanup();
+  }
+  if (previous?.timer != null) {
+    clearTimeout(previous.timer);
+  }
+  const binding = {
+    controller: new AbortController(),
+    cleanups: [],
+    observedGraphs: new Set(),
+    activePath: previous?.activePath || [],
+    timer: null,
+    mode: "passive",
+  };
+  WORKFLOW_BINDINGS.set(rootGraph, binding);
+  attachGraphEvents(rootGraph, binding);
+
+  const canvas = app.canvas?.canvas;
+  if (canvas?.addEventListener) {
+    canvas.addEventListener("subgraph-opening", (event) => {
+      const fromNode = event.detail?.fromNode;
+      const closingGraph = event.detail?.closingGraph;
+      if (!fromNode) {
+        return;
+      }
+      const base = presentationPath(rootGraph, closingGraph, binding);
+      if (base) {
+        binding.activePath = [...base, fromNode.id];
+        scheduleReconcile(rootGraph, "active");
+      }
+    }, { signal: binding.controller.signal });
+    canvas.addEventListener("subgraph-opened", () => {
+      const currentGraph = app.canvas?.graph || app.graph;
+      if (currentGraph === rootGraph) {
+        binding.activePath = [];
+      } else if (graphAtPath(rootGraph, binding.activePath) !== currentGraph) {
+        const candidates = pathsForGraph(rootGraph, currentGraph);
+        if (candidates.length === 1) {
+          binding.activePath = candidates[0];
+        }
+      }
+      scheduleReconcile(rootGraph, "passive");
+    }, { signal: binding.controller.signal });
+  }
+}
+
+
+function syncUnpack(node, preserveLinks = false) {
+  const root = rootGraphFor(graphFor(node));
+  const binding = WORKFLOW_BINDINGS.get(root);
+  const path = presentationPath(root, graphFor(node), binding);
+  const context = path ? upstreamPackContext(node, path) : upstreamPackContext(node);
+  if (context) {
+    applySchemaToUnpack(node, schemaForPackContext(root, context), preserveLinks);
+  }
+  scheduleReconcile(root, preserveLinks ? "passive" : "active");
+}
+
+
+function notifyConnectedUnpacks(pack, preserveLinks = false) {
+  scheduleReconcile(
+    rootGraphFor(graphFor(pack)),
+    preserveLinks ? "passive" : "active",
+  );
 }
 
 
@@ -444,6 +1283,8 @@ function configurePackInput(node, slotIndex, connected, linkInfo) {
       updatePack(node, true);
       return;
     }
+    delete input.color_on;
+    delete input.color_off;
     input.label = uniqueLabel(node, source.name, input);
     input.type = source.type;
     input.dynamicPipeType = source.type;
@@ -451,6 +1292,8 @@ function configurePackInput(node, slotIndex, connected, linkInfo) {
   } else {
     input.label = "*";
     input.type = "*";
+    delete input.color_on;
+    delete input.color_off;
     input.dynamicPipeConfigured = false;
     pruneEmptyInputs(node);
   }
@@ -460,6 +1303,7 @@ function configurePackInput(node, slotIndex, connected, linkInfo) {
 
 function setupNode(node) {
   hideSchemaWidget(node);
+  installSchemaSerializer(node);
   if (isNode(node, PACK)) {
     const savedFields = new Map(parseWidgetSchema(node).map((field) => [field.key, field]));
     for (const input of node.inputs || []) {
@@ -578,6 +1422,13 @@ app.registerExtension({
     }
 
     if (nodeData.name === PACK) {
+      const onDrawForeground = nodeType.prototype.onDrawForeground;
+      nodeType.prototype.onDrawForeground = function () {
+        const result = onDrawForeground?.apply(this, arguments);
+        refreshVisiblePack(this);
+        return result;
+      };
+
       const onConnectInput = nodeType.prototype.onConnectInput;
       nodeType.prototype.onConnectInput = function (slotIndex) {
         const result = onConnectInput?.apply(this, arguments);
@@ -608,6 +1459,7 @@ app.registerExtension({
 
   afterConfigureGraph() {
     const rootGraph = app.rootGraph || rootGraphFor(app.graph);
+    bindWorkflow(rootGraph);
     for (const graph of graphsFor(rootGraph)) {
       for (const node of nodesFor(graph)) {
         if (isNode(node, PACK) || isNode(node, UNPACK)) {
@@ -615,5 +1467,6 @@ app.registerExtension({
         }
       }
     }
+    scheduleReconcile(rootGraph, "passive");
   },
 });
