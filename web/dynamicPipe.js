@@ -315,6 +315,28 @@ function resolvedSourceDetails(resolved) {
 }
 
 
+function subgraphInputDetails(graph, slot, parentInput = null) {
+  const boundarySlot =
+    graph?.inputs?.[slot] ||
+    graph?.inputNode?.slots?.[slot];
+  if (!boundarySlot && !parentInput) {
+    return null;
+  }
+  return {
+    name: String(
+      boundarySlot?.displayName ||
+      boundarySlot?.label ||
+      boundarySlot?.localized_name ||
+      boundarySlot?.name ||
+      parentInput?.label ||
+      parentInput?.name ||
+      "value",
+    ),
+    type: String(boundarySlot?.type || parentInput?.type || "*"),
+  };
+}
+
+
 function dtoInstancePath(executableNode) {
   if (Array.isArray(executableNode?.subgraphNodePath)) {
     return [...executableNode.subgraphNodePath];
@@ -395,10 +417,25 @@ function resolvePhysicalLink(rootGraph, graph, link, path, visited = new Set()) 
   if (isInputBoundary) {
     const parent = parentInstance(rootGraph, path);
     const parentInput = parent?.node?.inputs?.[link.origin_slot];
+    const boundary = subgraphInputDetails(graph, link.origin_slot, parentInput);
     const outerLink = linkFor(parent?.graph, parentInput?.link);
-    return parent
+    const outerDetails = parent
       ? resolvePhysicalLink(rootGraph, parent.graph, outerLink, parent.path, visited)
       : null;
+    return {
+      // The subgraph input owns the semantic field name. The physical source
+      // may expose a generic name such as CONDITIONING, which must not replace
+      // user-defined boundary names such as positive and negative.
+      name: String(boundary?.name || outerDetails?.name || "value"),
+      // A disconnected parent still has a stable subgraph slot contract.
+      type: String(
+        outerDetails?.type && outerDetails.type !== "*"
+          ? outerDetails.type
+          : boundary?.type && boundary.type !== "*"
+            ? boundary.type
+            : parentInput?.type || "*",
+      ),
+    };
   }
 
   const origin = graph?.getNodeById?.(link.origin_id);
@@ -433,7 +470,14 @@ function derivePackSchemaFromContext(rootGraph, node, path) {
       path,
     );
     const previous = fallback.get(String(input.name));
-    const field = details || previous;
+    const field = details
+      ? {
+          name: details.name || previous?.name,
+          type: details.type && details.type !== "*"
+            ? details.type
+            : previous?.type || "*",
+        }
+      : previous;
     if (!details) {
       complete = false;
     }
@@ -471,6 +515,10 @@ function derivePackSchema(executableNode) {
       continue;
     }
 
+    const inputLink = linkFor(graphFor(node), input.link);
+    const boundary = isSubgraphInputLink(node, input)
+      ? subgraphInputDetails(graphFor(node), inputLink?.origin_slot)
+      : null;
     let details = null;
     try {
       // Dynamic Pack inputs accept every type. Passing an explicit wildcard is
@@ -483,12 +531,22 @@ function derivePackSchema(executableNode) {
       // A temporarily incomplete subgraph can fail resolution while it is edited.
     }
     const previous = fallback.get(String(input.name));
+    if (details && boundary) {
+      details = {
+        name: boundary.name,
+        type: details.type && details.type !== "*" ? details.type : boundary.type,
+      };
+    }
     if (!details) {
       complete = false;
-      details = previous || (isConfiguredInput(input) ? {
-        name: input.label || input.name,
-        type: input.dynamicPipeType || input.type || "*",
-      } : null);
+      details =
+        (boundary?.type !== "*" ? boundary : null) ||
+        previous ||
+        boundary ||
+        (isConfiguredInput(input) ? {
+          name: input.label || input.name,
+          type: input.dynamicPipeType || input.type || "*",
+        } : null);
     }
     if (!details) {
       continue;
