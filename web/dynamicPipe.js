@@ -405,16 +405,23 @@ function resolvePhysicalOutput(rootGraph, graph, node, slot, path, visited) {
 }
 
 
+function isSubgraphInputBoundary(graph, link) {
+  return Boolean(
+    link && (
+      link.originIsIoNode ||
+      link.origin_id === -10 ||
+      link.origin_id === graph?.inputNode?.id ||
+      graph?.getNodeById?.(link.origin_id) === graph?.inputNode
+    )
+  );
+}
+
+
 function resolvePhysicalLink(rootGraph, graph, link, path, visited = new Set()) {
   if (!link) {
     return null;
   }
-  const isInputBoundary = Boolean(
-    link.originIsIoNode ||
-    link.origin_id === -10 ||
-    link.origin_id === graph?.inputNode?.id
-  );
-  if (isInputBoundary) {
+  if (isSubgraphInputBoundary(graph, link)) {
     const parent = parentInstance(rootGraph, path);
     const parentInput = parent?.node?.inputs?.[link.origin_slot];
     const boundary = subgraphInputDetails(graph, link.origin_slot, parentInput);
@@ -815,13 +822,37 @@ function enterSubgraphOutput(subgraphNode, slot) {
 function upstreamPackContext(node, initialPath = []) {
   clearVirtualWatches(node);
   const visited = new Set();
+  const rootGraph = rootGraphFor(graphFor(node));
   let current = node;
   let path = [...initialPath];
   let input = current.inputs?.find((slot) => slot.name === "dynamic_pipe") || current.inputs?.[0];
 
   while (input?.link != null) {
-    const graph = graphFor(current);
-    const link = linkFor(graph, input.link);
+    let graph = graphFor(current);
+    let link = linkFor(graph, input.link);
+
+    // A link from the subgraph input node has no ordinary origin node. Walk
+    // through the matching SubgraphNode input in the parent instance until an
+    // actual outer source is reached. Repeating this also handles nesting.
+    while (isSubgraphInputBoundary(graph, link)) {
+      const boundaryKey = `boundary|${path.join(":")}|${link.origin_slot}`;
+      if (visited.has(boundaryKey)) {
+        return null;
+      }
+      visited.add(boundaryKey);
+
+      const parent = parentInstance(rootGraph, path);
+      const parentInput = parent?.node?.inputs?.[link.origin_slot];
+      const outerLink = linkFor(parent?.graph, parentInput?.link);
+      if (!parent || !parentInput || !outerLink) {
+        return null;
+      }
+
+      graph = parent.graph;
+      path = parent.path;
+      link = outerLink;
+    }
+
     let origin = graph?.getNodeById(link?.origin_id);
     let originSlot = link?.origin_slot;
     if (!origin) {
@@ -951,15 +982,7 @@ function presentationPath(rootGraph, graph, binding) {
 function isSubgraphInputLink(node, input) {
   const graph = graphFor(node);
   const link = linkFor(graph, input?.link);
-  if (!link) {
-    return false;
-  }
-  return Boolean(
-    link.originIsIoNode ||
-    link.origin_id === -10 ||
-    link.origin_id === graph?.inputNode?.id ||
-    graph?.getNodeById?.(link.origin_id) === graph?.inputNode
-  );
+  return isSubgraphInputBoundary(graph, link);
 }
 
 
